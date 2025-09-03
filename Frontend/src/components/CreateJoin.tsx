@@ -3,7 +3,12 @@ import { useSignal } from "../hooks/useSignal"
 
 export default function CreateJoin({ signal }:{ signal: ReturnType<typeof useSignal> }) {
   const [code, setCode] = useState("")
-  const canUse = ["open","mock","connecting"].includes(signal.status)
+  // Only allow create/join actions once the signalling channel is fully
+  // connected (or in mock mode). Previously the buttons were enabled while
+  // the websocket was still handshaking which could leave the UI stuck in a
+  // perpetual "Connecting" state after creating a room. Restricting actions
+  // avoids that confusing behaviour.
+  const canUse = signal.status === "open" || signal.status === "mock"
 
   return (
     <div className="card grid" style={{ gap:16 }}>
