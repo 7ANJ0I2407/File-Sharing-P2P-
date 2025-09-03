@@ -44,7 +44,7 @@ export default function WaitingPage() {
   // ---- bridge WS -> WebRTC while we're on /waiting ----
   useEffect(() => {
     // only attach if we have identity; otherwise we can’t process targeted messages
-    if (!me || !roomCode) return
+    // if (!me || !roomCode) return // removed for testing
     const off = signal.onMessage((m: WSMsg) => {
       // let p2p handle offer/answer/ice, etc.
       p2p.ingestWS(m)

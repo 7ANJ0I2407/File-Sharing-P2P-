@@ -29,11 +29,43 @@ type P2POptions = {
   onComplete?: (peerId: string, blob: Blob) => void
 }
 
+// add near the top of the file
+function waitForOpen(dc: RTCDataChannel, timeoutMs = 15000) {
+  return new Promise<void>((resolve, reject) => {
+    if (dc.readyState === "open") return resolve();
+    const onOpen = () => {
+      cleanup();
+      resolve();
+    };
+    const onCloseOrError = () => {
+      cleanup();
+      reject(new Error(`DataChannel not open (state=${dc.readyState})`));
+    };
+    const tid = setTimeout(() => {
+      cleanup();
+      reject(new Error("Timed out waiting for DataChannel open"));
+    }, timeoutMs);
+
+    function cleanup() {
+      clearTimeout(tid);
+      dc.removeEventListener("open", onOpen);
+      dc.removeEventListener("close", onCloseOrError);
+      dc.removeEventListener("error", onCloseOrError);
+    }
+
+    dc.addEventListener("open", onOpen, { once: true });
+    dc.addEventListener("close", onCloseOrError, { once: true });
+    dc.addEventListener("error", onCloseOrError, { once: true });
+  });
+}
+
+
 export function useP2P(opts: P2POptions) {
   const { roomCode, peerId: me, sendWS, onLog, onProgress, onReceiveProgress, onComplete } = opts
 
   // UI copy (for rendering)
   const [peers, setPeers] = useState<Map<string, PeerConn>>(new Map())
+  const bump = () => setPeers(prev => new Map(prev)); // helper to trigger rerende
   // authoritative live map (prevents stale closure in handleSignal)
   const peersRef = useRef<Map<string, PeerConn>>(new Map())
   // buffer ICE that arrives before a conn is created
@@ -58,11 +90,14 @@ export function useP2P(opts: P2POptions) {
     const dc = pc.createDataChannel(`file-${peerId}`, { ordered: true })
     const conn: PeerConn = { peerId, pc, dc, queue: [], sentBytes: 0, receivedBytes: 0 }
 
-    dc.binaryType = "arraybuffer"
-    dc.bufferedAmountLowThreshold = BUF_LO
-    dc.onopen = () => log(`dc open -> ${peerId}`)
-    dc.onclose = () => log(`dc closed -> ${peerId}`)
-    dc.onmessage = () => {} // ACKs ignored on sender
+    dc.binaryType = "arraybuffer";
+    dc.bufferedAmountLowThreshold = BUF_LO;
+    dc.onopen = () => { log?.(`[p2p] datachannel OPEN with ${peerId}`); bump(); };
+    dc.onclose = () => { log?.(`[p2p] datachannel CLOSED with ${peerId}`); bump(); };
+    pc.onconnectionstatechange = () => {
+      log?.(`[p2p] pc state -> ${pc.connectionState}`); bump();
+    };
+    dc.onmessage = () => { } // ACKs ignored on sender
     dc.onbufferedamountlow = () => {
       while (conn.queue.length && dc.bufferedAmount < BUF_HI) dc.send(conn.queue.shift()!)
     }
@@ -103,6 +138,7 @@ export function useP2P(opts: P2POptions) {
 
     // Receiver path: got an offer
     if (msg.t === "offer" && msg.to === me) {
+      console.log("[p2p] got offer from", msg.from, "-> sending answer")
       const from = msg.from
       const pc = new RTCPeerConnection({ iceServers })
       const parts: ArrayBuffer[] = []
@@ -113,7 +149,8 @@ export function useP2P(opts: P2POptions) {
         conn.dc = dc
         dc.binaryType = "arraybuffer"
         dc.bufferedAmountLowThreshold = BUF_LO
-        dc.onopen = () => log(`dc open <- ${from}`)
+        dc.onopen = () => { log?.(`dc open <- ${msg.from}`); bump(); };
+        dc.onclose = () => { log?.(`dc closed <- ${msg.from}`); bump(); };
 
         dc.onmessage = (ev) => {
           if (typeof ev.data === "string") {
@@ -128,7 +165,7 @@ export function useP2P(opts: P2POptions) {
                 window.dispatchEvent(new CustomEvent("p2p-progress", {
                   detail: { received: 0, total: meta.size, name: meta.name }
                 }))
-              } catch {}
+              } catch { }
             } else if (meta.t === "ack_req") {
               dc!.send(JSON.stringify({ t: "ack", transferId: conn.transferId, offset: conn.receivedBytes }))
             } else if (meta.t === "complete") {
@@ -159,61 +196,135 @@ export function useP2P(opts: P2POptions) {
       // drain buffered ICE
       const pending = pendingIceRef.current.get(from)
       if (pending && pending.length) {
-        for (const cand of pending) { try { await pc.addIceCandidate(cand) } catch {} }
+        for (const cand of pending) { try { await pc.addIceCandidate(cand) } catch { } }
         pendingIceRef.current.delete(from)
       }
+      console.log("[p2p] answer sent")
     }
   }
 
   // ---------- SENDING ----------
+  // sendFileTo(peerId, file) — replace the beginning with this
   async function sendFileTo(peerId: string, file: File) {
-    const conn = getPeer(peerId) || await connectTo(peerId)
-    const { dc } = conn
-    const transferId = `T-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
-    dc.send(JSON.stringify({ t: "meta", transferId, name: file.name, size: file.size, mime: file.type, chunkBytes: CHUNK_BYTES }))
-    conn.transferId = transferId
+    // (re)use or create connection
+    let conn = peers.get(peerId) || await connectTo(peerId);
+
+    // If we have a conn but its DC is not open yet, wait.
+    // This covers the "Send" click that happens before answer/ICE complete.
+    try {
+      await waitForOpen(conn.dc);
+    } catch (e) {
+      // If the channel failed/closed, try once to rebuild the connection
+      log?.(`[p2p] reopen attempt for ${peerId} because: ${(e as Error).message}`);
+      conn.pc.close();
+      peers.delete(peerId);
+      setPeers(new Map(peers)); // publish removal
+      conn = await connectTo(peerId);
+      await waitForOpen(conn.dc); // let this throw if still not open
+    }
+
+    const { dc } = conn;
+    if (dc.readyState !== "open") {
+      await new Promise<void>((resolve, reject) => {
+        const onOpen = () => { dc.removeEventListener("open", onOpen); resolve(); };
+        const onClose = () => {
+          dc.removeEventListener("open", onOpen);
+          reject(new Error("DataChannel closed before opening"));
+        };
+        dc.addEventListener("open", onOpen, { once: true });
+        // optional: give a quick failure path if it closes
+        dc.addEventListener("close", onClose, { once: true });
+      });
+    }
+    const transferId = `T-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+
+    // announce meta
+    dc.send(JSON.stringify({
+      t: "meta",
+      transferId,
+      name: file.name,
+      size: file.size,
+      mime: file.type,
+      chunkBytes: CHUNK_BYTES
+    }));
+    conn.transferId = transferId;
+
+    // stream frames with backpressure
     for await (const { buf } of readFileChunks(file)) {
       for (const f of frames(buf)) {
+        if (dc.readyState !== "open") {
+          throw new Error(`DataChannel became ${dc.readyState} mid-transfer`);
+        }
         if (dc.bufferedAmount > BUF_HI) {
           await new Promise(res => {
-            const h = () => { dc.removeEventListener("bufferedamountlow", h); res(null) }
-            dc.addEventListener("bufferedamountlow", h, { once: true })
-          })
+            const h = () => { dc.removeEventListener("bufferedamountlow", h); res(null); };
+            dc.addEventListener("bufferedamountlow", h, { once: true });
+          });
         }
-        dc.send(f)
-        conn.sentBytes += (f as ArrayBuffer).byteLength
-        opts.onProgress?.(peerId, conn.sentBytes, file.size)
+        dc.send(f);
+        conn.sentBytes += (f as ArrayBuffer).byteLength;
+        onProgress?.(peerId, conn.sentBytes, file.size);
       }
-      dc.send(JSON.stringify({ t: "ack_req", transferId, offset: conn.sentBytes }))
+      dc.send(JSON.stringify({ t: "ack_req", transferId, offset: conn.sentBytes }));
     }
-    dc.send(JSON.stringify({ t: "complete", transferId }))
+    dc.send(JSON.stringify({ t: "complete", transferId }));
   }
 
+
+  // sendFileToMany(peerIds, file) — ensure each DC is open before fanning out
   async function sendFileToMany(peerIds: string[], file: File) {
-    for (const id of peerIds) await connectTo(id)
-    const conns = peerIds.map(id => getPeer(id)!).filter(Boolean)
-    const transferId = `T-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
-    for (const c of conns) {
-      c.transferId = transferId
-      c.dc.send(JSON.stringify({ t: "meta", transferId, name: file.name, size: file.size, mime: file.type, chunkBytes: CHUNK_BYTES }))
-    }
-    for await (const { buf } of readFileChunks(file)) {
-      const fs = Array.from(frames(buf))
-      for (const c of conns) {
-        for (const f of fs) {
-          if (c.dc.bufferedAmount < BUF_HI) c.dc.send(f)
-          else c.queue.push(f)
-          c.dc.onbufferedamountlow = () => {
-            while (c.queue.length && c.dc.bufferedAmount < BUF_HI) c.dc.send(c.queue.shift()!)
-          }
-          c.sentBytes += (f as ArrayBuffer).byteLength
-          opts.onProgress?.(c.peerId, c.sentBytes, file.size)
+    // ensure connections and DCs are open
+    for (const id of peerIds) {
+      let c = peers.get(id) || await connectTo(id);
+      if (c.dc.readyState !== "open") {
+        try {
+          await waitForOpen(c.dc);
+        } catch {
+          // try one rebuild per peer
+          c.pc.close();
+          peers.delete(id);
+          setPeers(new Map(peers));
+          c = await connectTo(id);
+          await waitForOpen(c.dc);
         }
-        c.dc.send(JSON.stringify({ t: "ack_req", transferId, offset: c.sentBytes }))
       }
     }
-    for (const c of conns) c.dc.send(JSON.stringify({ t: "complete", transferId }))
+
+    const conns = peerIds.map(id => peers.get(id)!).filter(Boolean);
+    const transferId = `T-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+
+    for (const c of conns) {
+      c.transferId = transferId;
+      c.dc.send(JSON.stringify({
+        t: "meta",
+        transferId,
+        name: file.name,
+        size: file.size,
+        mime: file.type,
+        chunkBytes: CHUNK_BYTES
+      }));
+    }
+
+    for await (const { buf } of readFileChunks(file)) {
+      const fs = Array.from(frames(buf));
+      for (const c of conns) {
+        for (const f of fs) {
+          if (c.dc.readyState !== "open") throw new Error(`DC to ${c.peerId} closed`);
+          if (c.dc.bufferedAmount < BUF_HI) c.dc.send(f);
+          else c.queue.push(f);
+          c.dc.onbufferedamountlow = () => {
+            while (c.queue.length && c.dc.bufferedAmount < BUF_HI) c.dc.send(c.queue.shift()!);
+          };
+          c.sentBytes += (f as ArrayBuffer).byteLength;
+          onProgress?.(c.peerId, c.sentBytes, file.size);
+        }
+        c.dc.send(JSON.stringify({ t: "ack_req", transferId, offset: c.sentBytes }));
+      }
+    }
+
+    for (const c of conns) c.dc.send(JSON.stringify({ t: "complete", transferId }));
   }
+
 
   // external
   function ingestWS(msg: WSMsg) { handleSignal(msg) }

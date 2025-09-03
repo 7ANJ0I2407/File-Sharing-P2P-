@@ -119,6 +119,14 @@ useEffect(() => {
     updatePeer(toSenderId, { wantsToSend: true })
     signal.send({ t: "request_send", roomCode: signal.roomCode!, to: toSenderId, from: signal.peerId! })
   }
+    useEffect(() => {
+    // don’t attach until we know who we are (prevents early noise)
+    if (!signal.peerId) return;
+    const off = signal.onMessage((m: WSMsg) => {
+      p2p.ingestWS(m);   // <— the important part
+    });
+    return off;
+  }, [signal.peerId, signal.roomCode, p2p]);
 
   // release after I finish sending
   function releaseAfterSend(peerId: string) {
