@@ -1,19 +1,18 @@
 {
   "name": "p2p-signal",
   "version": "1.0.0",
-  "private": true,
+  "main": "dist/index.js",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
-    "start": "node dist/index.js",
-    "build": "tsc -p ."
+    "build": "tsc -p .",
+    "start": "node dist/index.js"
   },
   "dependencies": {
     "ws": "^8.16.0"
   },
   "devDependencies": {
-    "@types/node": "^24.3.0",
+    "@types/node": "^20.11.30",
     "@types/ws": "^8.18.1",
     "ts-node": "^10.9.2",
-    "typescript": "^5.9.2"
+    "typescript": "^5.4.5"
   }
 }
