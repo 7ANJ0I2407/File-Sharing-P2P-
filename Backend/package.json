@@ -2,17 +2,19 @@
   "name": "p2p-signal",
   "version": "1.0.0",
   "main": "dist/index.js",
+  "type": "commonjs",
+  "engines": { "node": ">=18" },          
   "scripts": {
     "build": "tsc -p .",
     "start": "node dist/index.js"
   },
   "dependencies": {
-    "ws": "^8.16.0",
+    "ws": "^8.16.0"
+  },
+  "devDependencies": {
     "@types/node": "^20.11.30",
     "@types/ws": "^8.18.1",
     "ts-node": "^10.9.2",
     "typescript": "^5.4.5"
-  },
-  "devDependencies": {
   }
 }

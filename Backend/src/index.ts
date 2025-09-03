@@ -1,5 +1,5 @@
-import http from "http"
-import { createWSServer } from "./server"
+import * as http from "http";  
+import { createWSServer } from "./server";
 
 const PORT = Number(process.env.PORT || 8787)
 
