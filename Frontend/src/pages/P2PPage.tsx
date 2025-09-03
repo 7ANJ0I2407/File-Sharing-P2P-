@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react"
+import { useEffect, useState } from "react"
 import { useSignal } from "../hooks/useSignal"
 import { useP2P } from "../hooks/useP2P"
 import CreateJoin from "../components/CreateJoin"
