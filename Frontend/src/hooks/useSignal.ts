@@ -1,5 +1,5 @@
 // src/hooks/useSignal.ts
-import React, { useEffect, useRef, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import type { WSMsg, Member, Role } from "../lib/types"
 
 type Status = "connecting" | "open" | "closed" | "mock"
