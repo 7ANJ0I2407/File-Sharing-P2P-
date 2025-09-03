@@ -8,7 +8,9 @@
     "moduleResolution": "node",
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "strict": true
+    "strict": true,
+    "lib": ["ES2020"],           // ⟵ add
+    "types": ["node", "ws"]      // ⟵ add
   },
   "include": ["src"],
   "exclude": ["node_modules"]
