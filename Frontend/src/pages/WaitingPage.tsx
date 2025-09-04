@@ -30,20 +30,20 @@ export default function WaitingPage() {
     roomCode,
     peerId: me,
     sendWS: signal.send,
-    onReceiveProgress: (_peerId, recv, tot) => {
-      setReceived(recv)
-      if (tot !== undefined) setTotal(tot)
-      window.dispatchEvent(new CustomEvent("p2p-progress", {
-        detail: {
-          received: recv, total: tot, name
-        }
-      }))
-    },
-    onComplete: (_peerId, blob) => {
-      window.dispatchEvent(new CustomEvent("p2p-complete", {
-        detail: { blob, name }
-      }))
-    }
+    // onReceiveProgress: (_peerId, recv, tot) => {
+    //   setReceived(recv)
+    //   if (tot !== undefined) setTotal(tot)
+    //   window.dispatchEvent(new CustomEvent("p2p-progress", {
+    //     detail: {
+    //       received: recv, total: tot, name
+    //     }
+    //   }))
+    // },
+    // onComplete: (_peerId, blob) => {
+    //   window.dispatchEvent(new CustomEvent("p2p-complete", {
+    //     detail: { blob, name }
+    //   }))
+    // }
   })
 
   // ---- bridge WS -> WebRTC while we're on /waiting ----
