@@ -1,13 +1,18 @@
-import React from "react"
+// Frontend/src/pages/LeftPage.tsx
+import React from "react";
+import LinkCreatePage from "./LinkCreatePage";
 
 export default function LeftPage() {
   return (
-    <div className="container grid" style={{ gap: 16, marginTop: 24 }}>
-      <h1>Left (Expiring Link) — Coming soon</h1>
-      <div className="card stack">
-        <p>This page will let you encrypt client-side and create an expiring, one-time link.</p>
-        <p className="small">For now, use the P2P mode from the home page.</p>
+    <div className="container stack" style={{ gap: 16, marginTop: 12 }}>
+      <h1>Expiring, One-Time Link</h1>
+      <p className="small">
+        Encrypts in your browser. Server stores only ciphertext. The link burns on first download.
+      </p>
+      <LinkCreatePage />
+      <div className="card small">
+        Tip: open the generated link in an incognito window to test the one-time behavior.
       </div>
     </div>
-  )
+  );
 }
