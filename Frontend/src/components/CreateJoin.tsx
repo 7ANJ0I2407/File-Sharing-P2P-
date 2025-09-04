@@ -1,4 +1,4 @@
-import React, { useState } from "react"
+import { useState } from "react"
 import { useSignal } from "../hooks/useSignal"
 
 export default function CreateJoin({ signal }:{ signal: ReturnType<typeof useSignal> }) {

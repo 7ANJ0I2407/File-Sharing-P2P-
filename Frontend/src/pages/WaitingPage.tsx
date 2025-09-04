@@ -1,4 +1,5 @@
-import React,  { useEffect, useMemo, useState } from "react"
+// src/pages/WaitingPage.tsx
+import React, { useEffect, useState } from "react"
 import { useLocation } from "react-router-dom"
 import ProgressBar from "../components/ProgressBar"
 import { useSignal } from "../hooks/useSignal"
@@ -30,8 +31,12 @@ export default function WaitingPage() {
     peerId: me,
     sendWS: signal.send,
     onReceiveProgress: (_peerId, recv, tot) => {
+      setReceived(recv)
+      if (tot !== undefined) setTotal(tot)
       window.dispatchEvent(new CustomEvent("p2p-progress", {
-        detail: { received: recv, total: tot, name }
+        detail: {
+          received: recv, total: tot, name
+        }
       }))
     },
     onComplete: (_peerId, blob) => {
@@ -43,17 +48,12 @@ export default function WaitingPage() {
 
   // ---- bridge WS -> WebRTC while we're on /waiting ----
   useEffect(() => {
-    // only attach if we have identity; otherwise we can’t process targeted messages
-    // if (!me || !roomCode) return // removed for testing
-    const off = signal.onMessage((m: WSMsg) => {
-      // let p2p handle offer/answer/ice, etc.
-      p2p.ingestWS(m)
-      // (room_closed is handled below via window event)
-    })
+    // Subscribe ASAP so early 'offer' isn't missed; handleSignal uses refs for ids.
+    const off = signal.onMessage((m: WSMsg) => p2p.ingestWS(m))
     return off
-  }, [me, roomCode, signal.onMessage, p2p])
+  }, [signal, p2p])
 
-  // ---- UI: progress + auto download (same as before) ----
+  // ---- UI: progress + auto download ----
   useEffect(() => {
     const onProg = (e: any) => {
       const d = e.detail as { received: number; total?: number; name?: string }

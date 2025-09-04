@@ -1,4 +1,5 @@
-import React, { useEffect, useMemo, useState } from "react"
+// src/components/RoomView.tsx
+import { useEffect, useMemo, useState } from "react"
 import type { Member } from "../lib/types"
 import PeerItem from "./PeerItem"
 import FilePicker from "./FilePicker"
@@ -21,6 +22,7 @@ type Props = {
   sendFileTo: (peerId: string, file: File) => void
   sendFileToMany: (peerIds: string[], file: File) => void
   leaveRoom?: () => void
+  connectTo?: (peerId: string) => Promise<any>
 }
 
 export default function RoomView(p: Props) {
@@ -29,10 +31,7 @@ export default function RoomView(p: Props) {
 
   const sender = useMemo(() => p.members.find(m => m.role === "sender"), [p.members])
   const receivers = useMemo(() => p.members.filter(m => m.role === "receiver"), [p.members])
-  const dcState = (peerId: string) => p.peers.get(peerId)?.dc?.readyState ?? "closed";
-  const dcOpen = (peerId: string) => dcState(peerId) === "open";
-
-
+  const dcState = (peerId: string) => p.peers.get(peerId)?.dc?.readyState ?? "closed"
 
   useEffect(() => {
     setSelected(prev => {
@@ -42,7 +41,17 @@ export default function RoomView(p: Props) {
     })
   }, [receivers.map(r => r.peerId).join("|")])
 
-  // ---------- SENDER VIEW ----------
+  // Optional: auto-connect from UI side too (harmless, safe to keep)
+  useEffect(() => {
+    if (p.role !== "sender" || !p.connectTo) return
+    for (const r of receivers) {
+      if (p.peerState[r.peerId]?.approved && (dcState(r.peerId) === "closed" || dcState(r.peerId) === "closing")) {
+        p.connectTo(r.peerId).catch(() => {})
+      }
+    }
+  }, [p.role, receivers.map(r => r.peerId).join("|"), JSON.stringify(p.peerState), p.connectTo])
+
+  // --- SENDER VIEW ---
   if (p.role === "sender") {
     const pending = receivers.filter(r => !p.peerState[r.peerId]?.approved)
     const approved = receivers.filter(r => p.peerState[r.peerId]?.approved)
@@ -83,21 +92,13 @@ export default function RoomView(p: Props) {
                       <strong>{r.peerId}</strong><span className="badge">receiver</span>
                       {st.locked ? <span className="badge">locked</span> : <span className="badge">idle</span>}
                     </div>
-                    <div className="row">
-                      {st.wantsToSend && !st.locked && (
-                        <>
-                          <button className="btn" onClick={() => p.onGrantSend(r.peerId)}>Allow send</button>
-                          <button className="btn secondary" onClick={() => p.onDenySend(r.peerId)}>Deny</button>
-                        </>
-                      )}
-                    </div>
                   </div>
 
                   <div style={{ marginTop: 8 }}>
                     <PeerItem
                       peerId={r.peerId}
                       checked={true}
-                      onToggle={() => { }}
+                      onToggle={() => {}}
                       sent={prog?.sentBytes || 0}
                       total={file?.size}
                     />
@@ -109,39 +110,28 @@ export default function RoomView(p: Props) {
                       <FilePicker onPick={setFile} />
                       <button
                         className="btn"
-                        disabled={!file || st.locked || !dcOpen(r.peerId)}
-                        title={
-                          st.locked
-                            ? "A transfer is already in progress"
-                            : !dcOpen(r.peerId)
-                              ? `Connecting to ${r.peerId}…`
-                              : ""
-                        }
+                        disabled={!file || st.locked}
+                        title={st.locked ? "A transfer is already in progress" : ""}
                         onClick={() => file && p.sendFileTo(r.peerId, file)}
                       >
-                        {!dcOpen(r.peerId) ? "Connecting…" : "Send file"}
+                        Send file
                       </button>
                     </div>
                     {file && <div className="small">{file.name} — {(file.size / 1024 / 1024).toFixed(1)} MB</div>}
-
-                    {/* Tiny status hint */}
                     <div className="small muted">Channel: {dcState(r.peerId)}</div>
                   </div>
-
                 </div>
               )
             })}
           </div>
         </section>
 
-        {p.leaveRoom && (
-          <button className="btn secondary" onClick={p.leaveRoom}>Leave Room</button>
-        )}
+        {p.leaveRoom && <button className="btn secondary" onClick={p.leaveRoom}>Leave Room</button>}
       </div>
     )
   }
 
-  // ---------- RECEIVER VIEW ----------
+  // --- RECEIVER VIEW ---
   const mySender = sender
   const st = mySender ? (p.peerState[mySender.peerId] || { approved: false, locked: false }) : { approved: false, locked: false }
   const myConn = mySender ? p.peers.get(mySender.peerId) : undefined
@@ -166,29 +156,18 @@ export default function RoomView(p: Props) {
         <>
           <div className="card" style={{ padding: 12 }}>
             <h3>{st.locked ? "Transfer in progress…" : "Waiting for file…"}</h3>
-            <div className="small">You can also request permission to send a file to the sender.</div>
             <div className="row" style={{ marginTop: 8 }}>
               <FilePicker onPick={setFile} />
-              <button
-                className="btn"
-                disabled={!file || st.locked}
-                onClick={() => p.onRequestSend(mySender.peerId)}
-              >
+              <button className="btn" disabled={!file || st.locked} onClick={() => p.onRequestSend(mySender.peerId)}>
                 Request to Transfer (me → sender)
               </button>
               <button
                 className="btn"
-                disabled={!file || !st.locked || !dcOpen(mySender.peerId)}
-                title={
-                  !st.locked
-                    ? "Wait for sender to allow your transfer"
-                    : !dcOpen(mySender.peerId)
-                      ? "Connecting…"
-                      : ""
-                }
+                disabled={!file || !st.locked}
+                title={!st.locked ? "Wait for sender to allow your transfer" : ""}
                 onClick={() => mySender && file && p.sendFileTo(mySender.peerId, file)}
               >
-                {!st.locked ? "Waiting for approval…" : !dcOpen(mySender.peerId) ? "Connecting…" : "Send now"}
+                {!st.locked ? "Waiting for approval…" : "Send now"}
               </button>
               <div className="small muted">Channel: {dcState(mySender.peerId)}</div>
             </div>
@@ -202,9 +181,7 @@ export default function RoomView(p: Props) {
         </>
       )}
 
-      {p.leaveRoom && (
-        <button className="btn secondary" onClick={p.leaveRoom}>Leave Room</button>
-      )}
+      {p.leaveRoom && <button className="btn secondary" onClick={p.leaveRoom}>Leave Room</button>}
     </div>
   )
 }

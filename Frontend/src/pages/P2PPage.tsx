@@ -1,3 +1,4 @@
+// src/pages/P2PPage.tsx
 import { useEffect, useState } from "react"
 import { useSignal } from "../hooks/useSignal"
 import { useP2P } from "../hooks/useP2P"
@@ -28,7 +29,6 @@ export default function P2PPage() {
     sendWS: signal.send,
   })
 
-  // unified leave handler (used by both sender & receiver UIs)
   const leaveAndHome = () => {
     signal.leaveRoom()
     navigate("/")
@@ -40,30 +40,55 @@ export default function P2PPage() {
     setPeerState(prev => ({ ...prev, [pid]: { ...currentPeerState(pid), ...patch } }))
 
   useEffect(() => {
+    if (signal.role !== "sender") return
+    const approvedIds = Object.entries(peerState)
+      .filter(([, st]) => st.approved)
+      .map(([id]) => id)
+
+    for (const id of approvedIds) {
+      if (!p2p.peers.get(id)) {
+        p2p.connectTo(id).catch(() => { })
+      }
+    }
+  }, [signal.role, peerState, p2p])
+
+
+  // Bridge WS -> P2P signaling
+  useEffect(() => {
+    const off = signal.onMessage((m: WSMsg) => p2p.ingestWS(m))
+    return off
+  }, [signal.onMessage, p2p])
+
+  // Handle room control messages
+  useEffect(() => {
     const off = signal.onMessage((m: WSMsg) => {
-      // targetted messages
-      // @ts-expect-error runtime narrowing
-      if ("to" in m && (m as any).to === signal.peerId) {
+      // targeted messages
+      if ("to" in (m as any) && (m as any).to === signal.peerId) {
         if (m.t === "approve_join") {
+          // receiver navigates to waiting
           navigate("/waiting", { state: { roomCode: signal.roomCode, me: signal.peerId } })
           const sender = signal.members.find(mm => mm.role === "sender")
           if (sender) updatePeer(sender.peerId, { approved: true })
           return
         }
         if (m.t === "grant_send") { updatePeer(m.from, { locked: true, sessionId: m.sessionId, wantsToSend: false }); return }
-        if (m.t === "deny_send")  { updatePeer(m.from, { wantsToSend: false }); alert(m.reason || "Sender denied transfer (busy)."); return }
+        if (m.t === "deny_send") { updatePeer(m.from, { wantsToSend: false }); alert(m.reason || "Sender denied transfer (busy)."); return }
         if (m.t === "transfer_release") { updatePeer(m.from, { locked: false, sessionId: undefined }); return }
-        if (m.t === "request_send")    { updatePeer(m.from, { wantsToSend: true }); return }
+        if (m.t === "request_send") { updatePeer(m.from, { wantsToSend: true }); return }
       }
       // room-level
       if ((m as any).t === "peer_left") {
-        setPeerState(prev => { const next = { ...prev } as any; delete next[(m as any).peerId]; return next })
+        setPeerState(prev => {
+          const next = { ...prev } as any
+          delete next[(m as any).peerId]
+          return next
+        })
       }
     })
     return off
   }, [signal.peerId, signal.roomCode, navigate, signal.onMessage])
 
-  // prune on members change
+  // Prune state when members change
   useEffect(() => {
     const active = new Set(signal.members.map(m => m.peerId))
     setPeerState(prev => {
@@ -74,34 +99,38 @@ export default function P2PPage() {
   }, [signal.members])
 
   // WaitingPage “Leave Room” bridge
-useEffect(() => {
-  const h = () => {
-    signal.leaveRoom()
-    window.dispatchEvent(new Event("app-leave-ack")) // ✅ tell WaitingPage we handled it
-    // then navigate home
-    navigate("/")  // if you keep P2PPage mounted while waiting, you can navigate too
-  }
-  window.addEventListener("app-leave-room", h as EventListener)
-  return () => window.removeEventListener("app-leave-room", h as EventListener)
-}, [signal.leaveRoom, navigate])
+  useEffect(() => {
+    const h = () => {
+      signal.leaveRoom()
+      window.dispatchEvent(new Event("app-leave-ack"))
+      navigate("/")
+    }
+    window.addEventListener("app-leave-room", h as EventListener)
+    return () => window.removeEventListener("app-leave-room", h as EventListener)
+  }, [signal.leaveRoom, navigate])
 
-// useEffect(() => {
-//   const onClosed = () => {
-//     signal.leaveRoom()
-//     // tell WaitingPage we handled it (if it’s open in another route)
-//     window.dispatchEvent(new Event("app-leave-ack"))
-//     navigate("/")
-//   }
-//   window.addEventListener("room-closed", onClosed as EventListener)
-//   return () => window.removeEventListener("room-closed", onClosed as EventListener)
-// }, [signal.leaveRoom, navigate])
+  // ❗ Auto-connect to any receiver that just became approved and has no connection yet
+  useEffect(() => {
+    const approvedIds = Object.entries(peerState)
+      .filter(([, st]) => st.approved)
+      .map(([id]) => id)
 
+    for (const id of approvedIds) {
+      if (!p2p.peers.get(id)) {
+        p2p.connectTo(id).catch(() => { })
+      }
+    }
+    // include p2p.peers size so effect re-evaluates when a conn is created
+  }, [peerState, p2p])
 
-  // sender actions
+  // Sender action: approve a receiver (NO hooks inside!)
   function approveReceiver(receiverId: string) {
     signal.send({ t: "approve_join", roomCode: signal.roomCode!, to: receiverId, from: signal.peerId! })
     updatePeer(receiverId, { approved: true })
+    // eager attempt; the top-level effect will also ensure we have a conn
+    p2p.connectTo(receiverId).catch(() => { })
   }
+
   function grantSend(receiverId: string) {
     const st = currentPeerState(receiverId); if (st.locked) return
     const sessionId = `S-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
@@ -112,23 +141,11 @@ useEffect(() => {
     updatePeer(receiverId, { wantsToSend: false })
     signal.send({ t: "deny_send", roomCode: signal.roomCode!, to: receiverId, from: signal.peerId!, reason: "Busy" })
   }
-
-  // receiver action
   function requestToSend(toSenderId: string) {
     const st = currentPeerState(toSenderId); if (st.locked) return
     updatePeer(toSenderId, { wantsToSend: true })
     signal.send({ t: "request_send", roomCode: signal.roomCode!, to: toSenderId, from: signal.peerId! })
   }
-    useEffect(() => {
-    // don’t attach until we know who we are (prevents early noise)
-    if (!signal.peerId) return;
-    const off = signal.onMessage((m: WSMsg) => {
-      p2p.ingestWS(m);   // <— the important part
-    });
-    return off;
-  }, [signal.peerId, signal.roomCode, p2p]);
-
-  // release after I finish sending
   function releaseAfterSend(peerId: string) {
     const st = currentPeerState(peerId)
     if (st.sessionId) {
@@ -163,7 +180,8 @@ useEffect(() => {
             for (const id of pids) await p2p.sendFileTo(id, file)
             for (const id of pids) releaseAfterSend(id)
           }}
-          leaveRoom={leaveAndHome}   // <- both sender & receiver can leave
+          leaveRoom={leaveAndHome}
+          connectTo={p2p.connectTo}
         />
       )}
     </div>

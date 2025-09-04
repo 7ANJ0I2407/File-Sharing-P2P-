@@ -1,5 +1,5 @@
 // src/hooks/useSignal.ts
-import React, { useEffect, useRef, useState } from "react"
+import React, { useEffect, useState } from "react"
 import type { WSMsg, Member, Role } from "../lib/types"
 
 type Status = "connecting" | "open" | "closed" | "mock"
@@ -42,9 +42,22 @@ function ensureSingleton(url?: string, allowMock = true) {
   if (!url) return singleton // mock mode
 
   let cancelled = false
+
+  const update = (patch: Partial<Pick<NonNullable<typeof singleton>, "status"|"roomCode"|"peerId"|"members">>) => {
+    singleton = { ...singleton!, ...patch }
+    const snapshot = {
+      status: singleton!.status,
+      roomCode: singleton!.roomCode,
+      peerId: singleton!.peerId,
+      role: singleton!.role,
+      members: singleton!.members,
+    }
+    for (const sub of singleton!.subs) try { sub(snapshot) } catch {}
+  }
+
   const connect = () => {
     if (cancelled) return
-    const ws = new WebSocket(url)
+    const ws = new WebSocket(url!)
     singleton!.ws = ws
     update({ status: "connecting" })
 
@@ -55,7 +68,7 @@ function ensureSingleton(url?: string, allowMock = true) {
       // flush queue
       for (const m of singleton!.sendQueue) ws.send(JSON.stringify(m))
       singleton!.sendQueue = []
-      // let any late-join components do things
+      // let any late-join components attach listeners
       for (const fn of singleton!.onopenHandlers) try { fn() } catch {}
     }
 
@@ -98,18 +111,6 @@ function ensureSingleton(url?: string, allowMock = true) {
     ws.onerror = () => { /* onclose does the retry */ }
   }
 
-  const update = (patch: Partial<Pick<typeof singleton, "status"|"roomCode"|"peerId"|"members">>) => {
-    singleton = { ...singleton!, ...patch }
-    const snapshot = {
-      status: singleton!.status,
-      roomCode: singleton!.roomCode,
-      peerId: singleton!.peerId,
-      role: singleton!.role,
-      members: singleton!.members,
-    }
-    for (const sub of singleton!.subs) try { sub(snapshot) } catch {}
-  }
-
   connect()
 
   // expose a cancel hook for HMR/unmount (not strictly needed in app)
@@ -142,7 +143,6 @@ export function useSignal() {
   }, [snap.roomCode, snap.peerId])
 
   const send = (msg: WSMsg) => {
-    // if we reconnect later, queue it
     const ws = s.ws
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg))
     else s.sendQueue.push(msg)
@@ -163,17 +163,9 @@ export function useSignal() {
     setSnap(prev => ({ ...prev, roomCode: "", peerId: "", members: [] }))
   }
 
-  // component-scoped message listener
+  // component-scoped message listener (attaches even if WS not open yet)
   const onMessage = React.useCallback((cb: (m: WSMsg) => void) => {
     const ws = s.ws
-    if (!ws) {
-      // if ws not ready yet, attach once it opens
-      const attach = () => {
-        s.onopenHandlers.delete(attach)
-        s.ws?.addEventListener("message-proxy", handler as EventListener)
-      }
-      s.onopenHandlers.add(attach)
-    }
     const handler = (ev: MessageEvent) => {
       const msg: WSMsg = JSON.parse(ev.data as any)
       if (
@@ -183,7 +175,15 @@ export function useSignal() {
         (msg as any).t === "room_closed"
       ) cb(msg)
     }
-    s.ws?.addEventListener("message-proxy", handler as EventListener)
+    if (!ws) {
+      const attach = () => {
+        s.onopenHandlers.delete(attach)
+        s.ws?.addEventListener("message-proxy", handler as EventListener)
+      }
+      s.onopenHandlers.add(attach)
+    } else {
+      ws.addEventListener("message-proxy", handler as EventListener)
+    }
     return () => s.ws?.removeEventListener("message-proxy", handler as EventListener)
   }, [])
 
