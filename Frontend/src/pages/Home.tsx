@@ -15,9 +15,9 @@ export default function Home() {
         </div>
 
         <div className="card stack">
-          <h2>Left (Later)</h2>
-          <p className="small">Leave an expiring, encrypted link (coming soon).</p>
-          <Link to="/left" className="btn secondary" style={{ textAlign: "center" }}>Preview Left</Link>
+          <h2>Download Once</h2>
+          <p className="small">Leave an expiring, encrypted link.</p>
+          <Link to="/once" className="btn secondary" style={{ textAlign: "center" }}>Go to Once</Link>
         </div>
       </div>
     </div>
