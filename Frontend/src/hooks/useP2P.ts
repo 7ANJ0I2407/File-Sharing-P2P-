@@ -169,6 +169,8 @@ export function useP2P(opts: P2POptions) {
               conn.fileName = meta.name
               conn.fileSize = meta.size
               conn.fileMime = meta.mime
+              parts.length = 0
+              conn.receivedBytes = 0
               // fire initial 0% progress so UI flips from "waiting"
               try {
                 window.dispatchEvent(new CustomEvent("p2p-progress", {
@@ -176,9 +178,13 @@ export function useP2P(opts: P2POptions) {
                 }))
               } catch { }
             } else if (meta.t === "ack_req") {
-              dc!.send(JSON.stringify({ t: "ack", transferId: conn.transferId, offset: conn.receivedBytes }))
+              if (meta.transferId === conn.transferId) {
+                dc!.send(JSON.stringify({ t: "ack", transferId: conn.transferId, offset: conn.receivedBytes }))
+              }
             } else if (meta.t === "complete") {
               const blob = new Blob(parts, { type: conn.fileMime || "application/octet-stream" })
+              parts.length = 0
+              conn.receivedBytes = 0
               // global event for WaitingPage + optional callback
               try {
                 window.dispatchEvent(new CustomEvent("p2p-complete", {
@@ -244,6 +250,8 @@ export function useP2P(opts: P2POptions) {
 
     const { dc } = conn
     const transferId = `T-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
+    conn.sentBytes = 0
+    conn.queue.length = 0
     dc.send(JSON.stringify({
       t: "meta", transferId, name: file.name, size: file.size, mime: file.type, chunkBytes: CHUNK_BYTES
     }))
@@ -287,6 +295,8 @@ export function useP2P(opts: P2POptions) {
     const transferId = `T-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
 
     for (const c of conns) {
+      c.sentBytes = 0
+      c.queue.length = 0
       c.transferId = transferId
       c.dc.send(JSON.stringify({ t: "meta", transferId, name: file.name, size: file.size, mime: file.type, chunkBytes: CHUNK_BYTES }))
     }
