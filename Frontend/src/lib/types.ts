@@ -4,7 +4,7 @@ export type WSMsg =
   | { t:"create_room"; role:Role }
   | { t:"room_created"; roomCode:string; peerId:string }
   | { t:"join_room"; roomCode:string; role:Role }
-  | { t:"room_joined"; peerId:string; members:{peerId:string; role:Role}[] }
+  | { t:"room_joined"; roomCode:string; peerId:string; members:{peerId:string; role:Role}[] }
   | { t:"peer_joined"; peerId:string; role:Role }
   | { t:"peer_left"; peerId:string }
   | { t:"offer"; roomCode:string; to:string; from:string; sdp:string }

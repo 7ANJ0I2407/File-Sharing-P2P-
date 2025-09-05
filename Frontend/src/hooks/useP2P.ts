@@ -3,8 +3,33 @@ import { useRef, useState, useEffect } from "react"
 import type { WSMsg } from "../lib/types"
 import { BUF_LO, BUF_HI, CHUNK_BYTES, frames, readFileChunks } from "../lib/chunker"
 
-const iceServers: RTCIceServer[] = [{ urls: ["stun:stun.l.google.com:19302"] }]
+// --- TURN/STUN ----------------------------------------------------------------
+function normalizeTurnUrls(raw?: string): string[] {
+  if (!raw) return []
+  return raw
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean)
+    .map(u => (/^(stun|turns?):/i.test(u) ? u : `turn:${u}`))
+    // keep only obviously valid-ish entries; drop junk like "turn:rela"
+    .filter(u => /^turns?:/.test(u))
+}
 
+const turnUrls = normalizeTurnUrls(import.meta.env.VITE_TURN_URL)
+const iceServers: RTCIceServer[] = [
+  { urls: ["stun:stun.l.google.com:19302"] },
+  ...(turnUrls.length
+    ? [
+        {
+          urls: turnUrls,
+          username: import.meta.env.VITE_TURN_USERNAME,
+          credential: import.meta.env.VITE_TURN_CREDENTIAL,
+        } as RTCIceServer,
+      ]
+    : []),
+]
+
+// --- Types --------------------------------------------------------------------
 export type PeerConn = {
   peerId: string
   pc: RTCPeerConnection
@@ -17,6 +42,9 @@ export type PeerConn = {
   fileMime?: string
   transferId?: string
   done?: boolean
+  answered?: boolean
+  gotOffer?: boolean
+  remoteAnswered?: boolean
 }
 
 type P2POptions = {
@@ -29,14 +57,14 @@ type P2POptions = {
   onComplete?: (peerId: string, blob: Blob) => void
 }
 
-// Wait until a DataChannel opens (resolves) or errors/closes (rejects)
+// --- Helpers ------------------------------------------------------------------
 function waitForOpen(dc: RTCDataChannel, timeoutMs = 15000) {
   return new Promise<void>((resolve, reject) => {
     if (dc.readyState === "open") return resolve()
     const onOpen = () => { cleanup(); resolve() }
     const onCloseOrErr = () => { cleanup(); reject(new Error(`dc state=${dc.readyState}`)) }
     const tid = setTimeout(() => { cleanup(); reject(new Error("dc open timeout")) }, timeoutMs)
-    const cleanup = () => {
+    function cleanup() {
       clearTimeout(tid)
       dc.removeEventListener("open", onOpen)
       dc.removeEventListener("close", onCloseOrErr)
@@ -48,18 +76,20 @@ function waitForOpen(dc: RTCDataChannel, timeoutMs = 15000) {
   })
 }
 
+// --- Hook ---------------------------------------------------------------------
 export function useP2P(opts: P2POptions) {
   const { roomCode, peerId: me, sendWS, onLog, onProgress, onReceiveProgress, onComplete } = opts
 
-  // UI copy (for rendering)
+  // UI copy
   const [peers, setPeers] = useState<Map<string, PeerConn>>(new Map())
   const bump = () => setPeers(prev => new Map(prev))
-  const roomRef = useRef(roomCode);
-  const meRef = useRef(me);
-  useEffect(() => { roomRef.current = roomCode }, [roomCode]);
-  useEffect(() => { meRef.current = me }, [me]);
 
-  // authoritative map / pending ICE
+  const roomRef = useRef(roomCode)
+  const meRef = useRef(me)
+  useEffect(() => { roomRef.current = roomCode }, [roomCode])
+  useEffect(() => { meRef.current = me }, [me])
+
+  // authoritative
   const peersRef = useRef<Map<string, PeerConn>>(new Map())
   const pendingIceRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map())
 
@@ -73,12 +103,39 @@ export function useP2P(opts: P2POptions) {
   }
   const getPeer = (id: string) => peersRef.current.get(id)
 
-  // ---------- SENDER: create conn + datachannel ----------
+  // --- Sender: connect + datachannel -----------------------------------------
   async function connectTo(peerId: string) {
     const existing = getPeer(peerId)
     if (existing) return existing
 
-    const pc = new RTCPeerConnection({ iceServers })
+    const pc = new RTCPeerConnection({
+      iceServers,
+      iceTransportPolicy: (import.meta.env.VITE_FORCE_TURN === "1" ? "relay" : "all"),
+      iceCandidatePoolSize: 1,
+      bundlePolicy: "max-bundle",
+    })
+
+    pc.oniceconnectionstatechange = () => log?.(`[p2p] ice=${pc.iceConnectionState}`)
+    pc.onconnectionstatechange = () => log?.(`[p2p] pc=${pc.connectionState}`)
+
+    pc.onicecandidate = (e) => {
+      if (e.candidate || e.candidate === null) {
+        // useful while debugging: console.log("[ICE]", e.candidate?.candidate)
+        sendWS({
+          t: "ice",
+          roomCode: roomRef.current,
+          to: peerId,
+          from: meRef.current,
+          candidate: e.candidate ?? null,
+        } as any)
+      }
+    }
+    pc.onicegatheringstatechange = () => {
+      if (pc.iceGatheringState === "complete") {
+        sendWS({ t: "ice", roomCode: roomRef.current, to: peerId, from: meRef.current, candidate: null } as any)
+      }
+    }
+
     const dc = pc.createDataChannel(`file-${peerId}`, { ordered: true })
     const conn: PeerConn = { peerId, pc, dc, queue: [], sentBytes: 0, receivedBytes: 0 }
 
@@ -86,14 +143,9 @@ export function useP2P(opts: P2POptions) {
     dc.bufferedAmountLowThreshold = BUF_LO
     dc.onopen = () => { log?.(`[p2p] dc OPEN -> ${peerId}`); bump() }
     dc.onclose = () => { log?.(`[p2p] dc CLOSED -> ${peerId}`); bump() }
-    dc.onmessage = () => { /* sender ignores small ACKs */ }
+    dc.onmessage = () => { /* sender ignores ack */ }
     dc.onbufferedamountlow = () => {
       while (conn.queue.length && dc.bufferedAmount < BUF_HI) dc.send(conn.queue.shift()!)
-    }
-
-    pc.onconnectionstatechange = () => { log?.(`[p2p] pc=${pc.connectionState}`); bump() }
-    pc.onicecandidate = (e) => {
-      if (e.candidate) sendWS({ t: "ice", roomCode: roomRef.current, to: peerId, from: meRef.current, candidate: e.candidate })
     }
 
     const offer = await pc.createOffer()
@@ -104,19 +156,28 @@ export function useP2P(opts: P2POptions) {
     return conn
   }
 
-  // ---------- COMMON: signaling ----------
+  // --- Signaling --------------------------------------------------------------
   async function handleSignal(msg: WSMsg) {
-    // Sender path: answer to my offer
+    // ANSWER (sender side)
     if (msg.t === "answer" && msg.to === meRef.current) {
-      const conn = getPeer(msg.from)
-      if (!conn) return
+      const conn = getPeer(msg.from); if (!conn) return
       const st = conn.pc.signalingState
-      // Only a valid time to apply a remote *answer* is when we have a local offer.
-      if (st !== "have-local-offer") {
-        log?.(`[p2p] ignore duplicate/late answer in state=${st} from ${msg.from}`)
+      if (conn.remoteAnswered || st !== "have-local-offer") {
+        log?.(`[p2p] ignore answer from ${msg.from} in state=${st}`)
         return
       }
-      await conn.pc.setRemoteDescription({ type: "answer", sdp: msg.sdp })
+      try {
+        await conn.pc.setRemoteDescription({ type: "answer", sdp: msg.sdp })
+        conn.remoteAnswered = true
+        const pending = pendingIceRef.current.get(msg.from)
+        if (pending) {
+          for (const cand of pending) { try { await conn.pc.addIceCandidate(cand) } catch {} }
+          pendingIceRef.current.delete(msg.from)
+        }
+        log?.(`[p2p] applied answer from ${msg.from}`)
+      } catch (e) {
+        log?.(`[p2p] failed to apply answer: ${(e as Error).message}`)
+      }
       return
     }
 
@@ -124,137 +185,176 @@ export function useP2P(opts: P2POptions) {
     if (msg.t === "ice" && msg.to === meRef.current) {
       const conn = getPeer(msg.from)
       if (conn) {
-        try { await conn.pc.addIceCandidate(msg.candidate) } catch { /* ignore bad trickle */ }
+        if (msg.candidate === null) { try { await conn.pc.addIceCandidate(null) } catch {}; return }
+        try { await conn.pc.addIceCandidate(msg.candidate) }
+        catch {
+          const list = pendingIceRef.current.get(msg.from) || []
+          list.push(msg.candidate)
+          pendingIceRef.current.set(msg.from, list)
+        }
       } else {
         const list = pendingIceRef.current.get(msg.from) || []
-        list.push(msg.candidate)
+        list.push(msg.candidate) // may be null
         pendingIceRef.current.set(msg.from, list)
       }
       return
     }
 
-    // Receiver path: got an offer
+    // OFFER (receiver side)
     if (msg.t === "offer" && msg.to === meRef.current) {
-      if (!roomRef.current && msg.roomCode) roomRef.current = msg.roomCode;
-      log?.(`[p2p] got offer from ${msg.from} -> sending answer`)
-      // const from = msg.from
-      // const pc = new RTCPeerConnection({ iceServers })
-      // const parts: ArrayBuffer[] = []
-      // const conn: PeerConn = { peerId: from, pc, dc: null as any, queue: [], sentBytes: 0, receivedBytes: 0 }
       const from = msg.from
       let conn = getPeer(from)
-      let pc: RTCPeerConnection
       if (!conn) {
-        pc = new RTCPeerConnection({ iceServers })
-        conn = { peerId: from, pc, dc: null as any, queue: [], sentBytes: 0, receivedBytes: 0 }
-        setPeer(from, conn) // store early so ICE can find it
-      } else {
-        pc = conn.pc
-      }
-      const parts: ArrayBuffer[] = []
+        const pc = new RTCPeerConnection({
+          iceServers,
+          iceTransportPolicy: (import.meta.env.VITE_FORCE_TURN === "1" ? "relay" : "all"),
+          iceCandidatePoolSize: 1,
+          bundlePolicy: "max-bundle",
+        })
 
-      pc.ondatachannel = (e) => {
-        const dc = e.channel
-        conn.dc = dc
-        dc.binaryType = "arraybuffer"
-        dc.bufferedAmountLowThreshold = BUF_LO
-        dc.onopen = () => { log?.(`dc open <- ${from}`); bump() }
-        dc.onclose = () => { log?.(`dc closed <- ${from}`); bump() }
+        pc.oniceconnectionstatechange = () => log?.(`[p2p] ice<= ${pc.iceConnectionState}`)
+        pc.onconnectionstatechange = () => log?.(`[p2p] pc<= ${pc.connectionState}`)
 
-        dc.onmessage = (ev) => {
-          if (typeof ev.data === "string") {
-            const meta = JSON.parse(ev.data)
-            if (meta.t === "meta") {
-              conn.transferId = meta.transferId
-              conn.fileName = meta.name
-              conn.fileSize = meta.size
-              conn.fileMime = meta.mime
-              parts.length = 0
-              conn.receivedBytes = 0
-              // fire initial 0% progress so UI flips from "waiting"
-              try {
-                window.dispatchEvent(new CustomEvent("p2p-progress", {
-                  detail: { received: 0, total: meta.size, name: meta.name }
-                }))
-              } catch { }
-            } else if (meta.t === "ack_req") {
-              if (meta.transferId === conn.transferId) {
-                dc!.send(JSON.stringify({ t: "ack", transferId: conn.transferId, offset: conn.receivedBytes }))
-              }
-            } else if (meta.t === "complete") {
-              const blob = new Blob(parts, { type: conn.fileMime || "application/octet-stream" })
-              parts.length = 0
-              conn.receivedBytes = 0
-              // global event for WaitingPage + optional callback
-              try {
-                window.dispatchEvent(new CustomEvent("p2p-complete", {
-                  detail: { blob, name: conn.fileName || "received" }
-                }))
-              } catch { }
-              onComplete?.(conn.peerId, blob)
-            }
-          } else if (ev.data instanceof ArrayBuffer) {
-            parts.push(ev.data)
-            conn.receivedBytes += ev.data.byteLength
-            // callback + global event so WaitingPage progress is instant
-            onReceiveProgress?.(conn.peerId, conn.receivedBytes, conn.fileSize)
-            try {
-              window.dispatchEvent(new CustomEvent("p2p-progress", {
-                detail: { received: conn.receivedBytes, total: conn.fileSize, name: conn.fileName }
-              }))
-            } catch { }
+        pc.onicecandidate = (e) => {
+          if (e.candidate || e.candidate === null) {
+            sendWS({
+              t: "ice",
+              roomCode: roomRef.current,
+              to: from,
+              from: meRef.current,
+              candidate: e.candidate ?? null,
+            } as any)
           }
         }
+        pc.onicegatheringstatechange = () => {
+          if (pc.iceGatheringState === "complete") {
+            sendWS({ t: "ice", roomCode: roomRef.current, to: from, from: meRef.current, candidate: null } as any)
+          }
+        }
+
+        // Receiver: datachannel arrives from sender
+        pc.ondatachannel = (e) => {
+          const dc = e.channel
+          conn!.dc = dc
+          dc.binaryType = "arraybuffer"
+          dc.bufferedAmountLowThreshold = BUF_LO
+          dc.onopen = () => { log?.(`dc open <- ${from}`); bump() }
+          dc.onclose = () => { log?.(`dc closed <- ${from}`); bump() }
+
+          const parts: ArrayBuffer[] = []
+
+          dc.onmessage = (ev) => {
+            // 1) control/meta/complete/ack
+            if (typeof ev.data === "string") {
+              const meta = JSON.parse(ev.data)
+              if (meta.t === "meta") {
+                conn!.transferId = meta.transferId
+                conn!.fileName = meta.name
+                conn!.fileSize = meta.size
+                conn!.fileMime = meta.mime
+                conn!.receivedBytes = 0
+                try {
+                  window.dispatchEvent(new CustomEvent("p2p-progress", {
+                    detail: { received: 0, total: meta.size, name: meta.name }
+                  }))
+                } catch {}
+                return
+              }
+              if (meta.t === "ack_req") {
+                dc!.send(JSON.stringify({ t: "ack", transferId: conn!.transferId, offset: conn!.receivedBytes }))
+                return
+              }
+              if (meta.t === "complete") {
+                if (conn!.done) return
+                conn!.done = true
+                const blob = new Blob(parts, { type: conn!.fileMime || "application/octet-stream" })
+                try {
+                  window.dispatchEvent(new CustomEvent("p2p-complete", {
+                    detail: { blob, name: conn!.fileName || "received" }
+                  }))
+                } catch {}
+                onComplete?.(conn!.peerId, blob)
+                return
+              }
+              return
+            }
+
+            // 2) binary payloads: ArrayBuffer | Blob | TypedArray
+            ;(async () => {
+              let ab: ArrayBuffer | null = null
+              if (ev.data instanceof ArrayBuffer) {
+                ab = ev.data as ArrayBuffer
+              } else if (typeof Blob !== "undefined" && ev.data instanceof Blob) {
+                ab = await (ev.data as Blob).arrayBuffer()
+              } else if (ArrayBuffer.isView(ev.data)) {
+                const v = ev.data as ArrayBufferView
+                ab = v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength)
+              }
+              if (!ab) {
+                log?.("[p2p] unknown binary payload type; dropping")
+                return
+              }
+              parts.push(ab)
+              conn!.receivedBytes += ab.byteLength
+              onReceiveProgress?.(conn!.peerId, conn!.receivedBytes, conn!.fileSize)
+              try {
+                window.dispatchEvent(new CustomEvent("p2p-progress", {
+                  detail: { received: conn!.receivedBytes, total: conn!.fileSize, name: conn!.fileName }
+                }))
+              } catch {}
+            })().catch(() => {})
+          }
+        }
+
+        conn = { peerId: from, pc, dc: null as any, queue: [], sentBytes: 0, receivedBytes: 0, answered: false }
+        setPeer(from, conn)
       }
 
-      pc.onicecandidate = (e) => {
-        if (e.candidate) sendWS({ t: "ice", roomCode: roomRef.current || msg.roomCode, to: from, from: meRef.current, candidate: e.candidate })
-      }
-      if (pc.signalingState === "have-local-offer") {
-        try { await pc.setLocalDescription({ type: "rollback" } as any) } catch { }
+      const pc = conn.pc
+
+      if (pc.signalingState !== "stable") {
+        try { await pc.setLocalDescription({ type: "rollback" } as any); log?.("[p2p] rollback for new offer") } catch {}
       }
 
-      await pc.setRemoteDescription({ type: "offer", sdp: msg.sdp })
-      const answer = await pc.createAnswer()
-      await pc.setLocalDescription(answer)
-      log?.("[p2p] sending answer to " + from)
-      sendWS({ t: "answer", roomCode: roomRef.current || msg.roomCode, to: from, from: meRef.current, sdp: answer.sdp! })
+      try {
+        await pc.setRemoteDescription({ type: "offer", sdp: msg.sdp })
+        const answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+        conn.answered = true
+        sendWS({ t: "answer", roomCode: roomRef.current, to: from, from: meRef.current, sdp: answer.sdp! })
 
-      // store conn immediately (so subsequent ICE finds it)
-      // setPeer(from, conn)
-
-      // drain buffered ICE if any
-      const pending = pendingIceRef.current.get(from)
-      if (pending && pending.length) {
-        for (const cand of pending) { try { await pc.addIceCandidate(cand) } catch { } }
-        pendingIceRef.current.delete(from)
+        const pending = pendingIceRef.current.get(from)
+        if (pending) {
+          for (const cand of pending) { try { await pc.addIceCandidate(cand) } catch {} }
+          pendingIceRef.current.delete(from)
+        }
+        log?.("[p2p] answer sent")
+      } catch (e) {
+        log?.(`[p2p] failed to answer: ${(e as Error).message}`)
       }
-      log?.("[p2p] answer sent")
+      return
     }
   }
 
-  // ---------- SENDING ----------
+  // --- Sending ---------------------------------------------------------------
   async function sendFileTo(peerId: string, file: File) {
     let conn = peersRef.current.get(peerId) || await connectTo(peerId)
 
-    // wait until the DC is actually open
     try { await waitForOpen(conn.dc) }
     catch (e) {
       log?.(`[p2p] reopen ${peerId} because: ${(e as Error).message}`)
-      try { conn.pc.close() } catch { }
+      try { conn.pc.close() } catch {}
       peersRef.current.delete(peerId)
       setPeers(new Map(peersRef.current))
       conn = await connectTo(peerId)
-      await waitForOpen(conn.dc) // throw if still not open
+      await waitForOpen(conn.dc)
     }
 
     const { dc } = conn
     const transferId = `T-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
     conn.sentBytes = 0
     conn.queue.length = 0
-    dc.send(JSON.stringify({
-      t: "meta", transferId, name: file.name, size: file.size, mime: file.type, chunkBytes: CHUNK_BYTES
-    }))
+    dc.send(JSON.stringify({ t: "meta", transferId, name: file.name, size: file.size, mime: file.type, chunkBytes: CHUNK_BYTES }))
     conn.transferId = transferId
 
     for await (const { buf } of readFileChunks(file)) {
@@ -276,13 +376,12 @@ export function useP2P(opts: P2POptions) {
   }
 
   async function sendFileToMany(peerIds: string[], file: File) {
-    // ensure all DCs are open
     for (const id of peerIds) {
       let c = peersRef.current.get(id) || await connectTo(id)
       if (c.dc.readyState !== "open") {
         try { await waitForOpen(c.dc) }
         catch {
-          try { c.pc.close() } catch { }
+          try { c.pc.close() } catch {}
           peersRef.current.delete(id)
           setPeers(new Map(peersRef.current))
           c = await connectTo(id)
@@ -321,12 +420,14 @@ export function useP2P(opts: P2POptions) {
     for (const c of conns) c.dc.send(JSON.stringify({ t: "complete", transferId }))
   }
 
-  // external
+  // --- External API -----------------------------------------------------------
   function ingestWS(msg: WSMsg) { handleSignal(msg) }
+
   function removePeer(peerId: string) {
     const next = new Map(peersRef.current)
     const c = next.get(peerId)
-    c?.dc.close(); c?.pc.close()
+    try { c?.dc.close() } catch {}
+    try { c?.pc.close() } catch {}
     next.delete(peerId)
     peersRef.current = next
     setPeers(next)
