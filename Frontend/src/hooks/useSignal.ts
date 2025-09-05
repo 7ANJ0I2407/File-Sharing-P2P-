@@ -68,7 +68,7 @@ function ensureSingleton(url?: string, allowMock = true) {
       // flush queue
       for (const m of singleton!.sendQueue) ws.send(JSON.stringify(m))
       singleton!.sendQueue = []
-      // let any late-join components attach listeners
+      // let late-join components attach listeners
       for (const fn of singleton!.onopenHandlers) try { fn() } catch {}
     }
 
@@ -79,7 +79,7 @@ function ensureSingleton(url?: string, allowMock = true) {
       if (m.t === "room_created") {
         update({ roomCode: m.roomCode, peerId: m.peerId, members: [] })
       } else if (m.t === "room_joined") {
-        update({ peerId: m.peerId, members: m.members })
+        update({ roomCode: m.roomCode, peerId: m.peerId, members: m.members })
       } else if (m.t === "peer_joined") {
         const members = [
           ...singleton!.members.filter(p => p.peerId !== m.peerId),
@@ -113,7 +113,6 @@ function ensureSingleton(url?: string, allowMock = true) {
 
   connect()
 
-  // expose a cancel hook for HMR/unmount (not strictly needed in app)
   ;(window as any).__signal_cancel__ = () => { cancelled = true }
 
   return singleton
@@ -135,7 +134,7 @@ export function useSignal() {
     return () => { s.subs.delete(sub) }
   }, [])
 
-  // keep onbeforeunload leave
+  // leave politely on unload
   useEffect(() => {
     const onUnload = () => { try { leaveRoom() } catch {} }
     window.addEventListener("beforeunload", onUnload)
@@ -159,7 +158,6 @@ export function useSignal() {
   function leaveRoom() {
     if (!snap.roomCode || !snap.peerId) return
     try { send({ t: "leave_room", roomCode: snap.roomCode } as any) } catch {}
-    // clear local snapshot immediately
     setSnap(prev => ({ ...prev, roomCode: "", peerId: "", members: [] }))
   }
 

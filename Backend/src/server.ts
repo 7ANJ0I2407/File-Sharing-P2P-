@@ -113,25 +113,45 @@ export function createWSServer(server: Server) {
       }
 
       if (m.t === "join_room") {
-        const room = rooms[m.roomCode];
+        const room = rooms[m.roomCode]
         if (!room) { ws.send(JSON.stringify({ t: "error", msg: "bad_room" })); return }
-        c.room = m.roomCode;
-        c.peerId = pid();
-        c.role = m.role as Role;
-        room.set(c.peerId, c);
+        c.room = m.roomCode
+        c.peerId = pid()
+        c.role = m.role as Role
+        room.set(c.peerId, c)
+
         const members = [...room.entries()]
           .filter(([id]) => id !== c.peerId)
-          .map(([peerId, cl]) => ({ peerId, role: cl.role! }));
-        ws.send(JSON.stringify({ t: "room_joined", peerId: c.peerId, members }));
-        broadcast(room, { t: "peer_joined", peerId: c.peerId, role: c.role }, c.peerId);
-        return;
+          .map(([peerId, cl]) => ({ peerId, role: cl.role! }))
+
+        // ⭐ include roomCode so clients can store & display it
+        ws.send(JSON.stringify({
+          t: "room_joined",
+          roomCode: m.roomCode,      // <— add this
+          peerId: c.peerId,
+          members
+        }))
+
+        broadcast(room, { t: "peer_joined", peerId: c.peerId, role: c.role }, c.peerId)
+        return
       }
 
       if (m.t === "leave_room") { removeFromRoom(c); return }
 
       if (["offer", "answer", "ice", "approve_join", "request_send", "grant_send", "deny_send", "transfer_release"].includes(m.t)) {
-        const room = rooms[m.roomCode]; if (!room) return;
+        if (!c.room || !c.peerId) return;
+        const room = rooms[c.room]; if (!room) return;
         const target = room.get(m.to as string); if (!target) return;
+
+        // ⭐ stamp trusted metadata
+        m.from = c.peerId;
+        m.roomCode = c.room;
+
+        // ⭐ glare guard by role
+        if (m.t === "offer" && c.role !== "sender") return;   // only sender may offer
+        if (m.t === "answer" && c.role !== "receiver") return; // only receiver may answer
+
+        // allow ICE both ways (including {candidate:null})
         try { target.ws.send(JSON.stringify(m)) } catch { }
         return;
       }
